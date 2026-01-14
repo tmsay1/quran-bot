@@ -1,9 +1,8 @@
 FROM python:3.13-slim
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg fontconfig && \
-    (apt-get install -y --no-install-recommends fonts-amiri || apt-get install -y --no-install-recommends fonts-noto-core) && \
-    rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg fontconfig fonts-noto-core fonts-noto-extra \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY requirements.txt .
