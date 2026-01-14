@@ -1,40 +1,73 @@
 import os
 import re
+import io
+import json
 import asyncio
 import shutil
 import random
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 from dotenv import load_dotenv
+
 import yt_dlp
+import aiohttp
+
+from PIL import Image, ImageDraw, ImageFont
+import arabic_reshaper
+from bidi.algorithm import get_display
 
 # =========================
-# التوكن (لا تحطه بالكود نهائياً)
-# Railway Variables: DISCORD_TOKEN
+# ENV
 # =========================
 load_dotenv()
-TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
+
+TOKEN = (os.getenv("DISCORD_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 if not TOKEN:
-    raise SystemExit("DISCORD_TOKEN is missing. Set it in Railway Variables.")
+    raise SystemExit("❌ DISCORD_TOKEN/BOT_TOKEN is missing. Set it in Railway Variables.")
 
 PREFIX = (os.getenv("PREFIX") or "!").strip() or "!"
-SYNC_GUILD_ID = (os.getenv("SYNC_GUILD_ID") or "").strip()  # اختياري لتظهر السلاش بسرعة داخل سيرفرك
+
+# تقدر تطفي أوامر البريفكس إذا ما مفعل Message Content Intent بالبوابة
+ENABLE_PREFIX_COMMANDS = (os.getenv("ENABLE_PREFIX_COMMANDS", "1").strip() == "1")
+
+# Presence حتى يبين للناس شلون يشغلون
+PRESENCE_TEXT = os.getenv("PRESENCE_TEXT", "!playall /playall")
+
+# Optional: لتسريع ظهور الـ Slash Commands بسيرفرك أثناء التطوير
+SYNC_GUILD_ID = (os.getenv("SYNC_GUILD_ID") or "").strip()  # حط رقم سيرفرك إذا تريد (مو ضروري)
 
 # =========================
-# إعدادات التشغيل التلقائي
+# تشغيل تلقائي للروم الصوتي (اختياري)
 # =========================
 AUTO_REFILL_DEFAULT_LIST = True
 SHUFFLE_ON_REFILL = False
-AUTO_JOIN_VOICE_CHANNEL_ID = os.getenv("AUTO_JOIN_VOICE_CHANNEL_ID")  # رقم روم الصوت (اختياري)
-AUTO_PLAY_ON_READY = (os.getenv("AUTO_PLAY_ON_READY") or "0").strip() == "1"
+AUTO_JOIN_VOICE_CHANNEL_ID = None  # مثال: 123...
 
 # =========================
-# روابط/بحث يوتيوب (موسّعة 60+)
-# ملاحظة: استخدمت ytsearch1: حتى دائماً يجيب من يوتيوب بدون ما نمسك IDs ممكن تتغير
+# قالب الآيات (الرابط اللي عطيتني)
+# =========================
+AYAH_TEMPLATE_URL = "https://i.postimg.cc/6p7DJpm6/quran-template-transparent.png"
+
+# كل نص ساعة
+POST_INTERVAL_MINUTES = int(os.getenv("POST_INTERVAL_MINUTES", "30"))
+
+# خط عربي داخل Docker (DejaVu)
+AR_FONT_PATH = os.getenv("AR_FONT_PATH", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+
+# حجم الخط
+AYAH_FONT_SIZE = int(os.getenv("AYAH_FONT_SIZE", "34"))
+REF_FONT_SIZE = int(os.getenv("REF_FONT_SIZE", "22"))
+
+# ملف إعدادات السيرفرات (قناة إرسال الآيات)
+CONFIG_FILE = "guild_settings.json"
+
+# =========================
+# روابط/بحث يوتيوب (50+)
+# (مو لازم تكون كلها روابط مباشرة—ممكن تكون كلمات بحث، والبوت يسوي ytsearch)
 # =========================
 DEFAULT_SONG_URLS = [
     # روابطك الأصلية
@@ -49,96 +82,99 @@ DEFAULT_SONG_URLS = [
     "https://youtu.be/p35TFiz_PDQ?si=OWTCmZ8Ps97tlCpV",
     "https://youtu.be/fRkVxypqpHA?si=c4E6XVbHPV0PRwk1",
 
-    # +50 بحث يوتيوب (سور + أجزاء)
-    "ytsearch1:جزء عم كامل مشاري العفاسي",
-    "ytsearch1:جزء تبارك كامل مشاري العفاسي",
-    "ytsearch1:سورة الفاتحة مشاري العفاسي",
-    "ytsearch1:سورة البقرة مشاري العفاسي كاملة",
-    "ytsearch1:سورة آل عمران مشاري العفاسي كاملة",
-    "ytsearch1:سورة النساء مشاري العفاسي كاملة",
-    "ytsearch1:سورة المائدة مشاري العفاسي كاملة",
-    "ytsearch1:سورة الأنعام مشاري العفاسي كاملة",
-    "ytsearch1:سورة الأعراف مشاري العفاسي كاملة",
-    "ytsearch1:سورة يونس مشاري العفاسي كاملة",
-    "ytsearch1:سورة هود مشاري العفاسي كاملة",
-    "ytsearch1:سورة يوسف مشاري العفاسي كاملة",
-    "ytsearch1:سورة الإسراء مشاري العفاسي كاملة",
-    "ytsearch1:سورة الكهف مشاري العفاسي كاملة",
-    "ytsearch1:سورة مريم مشاري العفاسي كاملة",
-    "ytsearch1:سورة طه مشاري العفاسي كاملة",
-    "ytsearch1:سورة الأنبياء مشاري العفاسي كاملة",
-    "ytsearch1:سورة المؤمنون مشاري العفاسي كاملة",
-    "ytsearch1:سورة النور مشاري العفاسي كاملة",
-    "ytsearch1:سورة الفرقان مشاري العفاسي كاملة",
-    "ytsearch1:سورة يس مشاري العفاسي",
-    "ytsearch1:سورة الصافات مشاري العفاسي",
-    "ytsearch1:سورة الزمر مشاري العفاسي",
-    "ytsearch1:سورة غافر مشاري العفاسي",
-    "ytsearch1:سورة فصلت مشاري العفاسي",
-    "ytsearch1:سورة الدخان مشاري العفاسي",
-    "ytsearch1:سورة الفتح مشاري العفاسي",
-    "ytsearch1:سورة قاف مشاري العفاسي",
-    "ytsearch1:سورة الذاريات مشاري العفاسي",
-    "ytsearch1:سورة الطور مشاري العفاسي",
-    "ytsearch1:سورة النجم مشاري العفاسي",
-    "ytsearch1:سورة القمر مشاري العفاسي",
-    "ytsearch1:سورة الرحمن مشاري العفاسي",
-    "ytsearch1:سورة الواقعة مشاري العفاسي",
-    "ytsearch1:سورة الحديد مشاري العفاسي",
-    "ytsearch1:سورة الحشر مشاري العفاسي",
-    "ytsearch1:سورة الجمعة مشاري العفاسي",
-    "ytsearch1:سورة المنافقون مشاري العفاسي",
-    "ytsearch1:سورة التغابن مشاري العفاسي",
-    "ytsearch1:سورة الطلاق مشاري العفاسي",
-    "ytsearch1:سورة التحريم مشاري العفاسي",
-    "ytsearch1:سورة الملك مشاري العفاسي",
-    "ytsearch1:سورة القلم مشاري العفاسي",
-    "ytsearch1:سورة الحاقة مشاري العفاسي",
-    "ytsearch1:سورة المعارج مشاري العفاسي",
-    "ytsearch1:سورة نوح مشاري العفاسي",
-    "ytsearch1:سورة الجن مشاري العفاسي",
-    "ytsearch1:سورة المزمل مشاري العفاسي",
-    "ytsearch1:سورة المدثر مشاري العفاسي",
-    "ytsearch1:سورة القيامة مشاري العفاسي",
-    "ytsearch1:سورة الإنسان مشاري العفاسي",
-    "ytsearch1:سورة المرسلات مشاري العفاسي",
-    "ytsearch1:سورة النبأ مشاري العفاسي",
-    "ytsearch1:سورة النازعات مشاري العفاسي",
-    "ytsearch1:سورة عبس مشاري العفاسي",
-    "ytsearch1:سورة التكوير مشاري العفاسي",
-    "ytsearch1:سورة الانفطار مشاري العفاسي",
-    "ytsearch1:سورة المطففين مشاري العفاسي",
-    "ytsearch1:سورة الانشقاق مشاري العفاسي",
-    "ytsearch1:سورة البروج مشاري العفاسي",
-    "ytsearch1:سورة الطارق مشاري العفاسي",
-    "ytsearch1:سورة الأعلى مشاري العفاسي",
-    "ytsearch1:سورة الغاشية مشاري العفاسي",
-    "ytsearch1:سورة الفجر مشاري العفاسي",
-    "ytsearch1:سورة البلد مشاري العفاسي",
-    "ytsearch1:سورة الشمس مشاري العفاسي",
-    "ytsearch1:سورة الليل مشاري العفاسي",
-    "ytsearch1:سورة الضحى مشاري العفاسي",
-    "ytsearch1:سورة الشرح مشاري العفاسي",
-    "ytsearch1:سورة التين مشاري العفاسي",
-    "ytsearch1:سورة العلق مشاري العفاسي",
-    "ytsearch1:سورة القدر مشاري العفاسي",
-    "ytsearch1:سورة البينة مشاري العفاسي",
-    "ytsearch1:سورة الزلزلة مشاري العفاسي",
-    "ytsearch1:سورة العاديات مشاري العفاسي",
-    "ytsearch1:سورة القارعة مشاري العفاسي",
-    "ytsearch1:سورة التكاثر مشاري العفاسي",
-    "ytsearch1:سورة العصر مشاري العفاسي",
-    "ytsearch1:سورة الهمزة مشاري العفاسي",
-    "ytsearch1:سورة الفيل مشاري العفاسي",
-    "ytsearch1:سورة قريش مشاري العفاسي",
-    "ytsearch1:سورة الماعون مشاري العفاسي",
-    "ytsearch1:سورة الكوثر مشاري العفاسي",
-    "ytsearch1:سورة الكافرون مشاري العفاسي",
-    "ytsearch1:سورة النصر مشاري العفاسي",
-    "ytsearch1:سورة المسد مشاري العفاسي",
-    "ytsearch1:سورة الإخلاص مشاري العفاسي",
-    "ytsearch1:سورة الفلق مشاري العفاسي",
-    "ytsearch1:سورة الناس مشاري العفاسي",
+    # +50 بحث (يشتغل عبر ytsearch)
+    "سورة الفاتحة مشاري العفاسي",
+    "سورة البقرة مشاري العفاسي",
+    "سورة آل عمران مشاري العفاسي",
+    "سورة النساء مشاري العفاسي",
+    "سورة المائدة مشاري العفاسي",
+    "سورة الأنعام مشاري العفاسي",
+    "سورة الأعراف مشاري العفاسي",
+    "سورة الأنفال مشاري العفاسي",
+    "سورة التوبة مشاري العفاسي",
+    "سورة يونس مشاري العفاسي",
+    "سورة هود مشاري العفاسي",
+    "سورة يوسف مشاري العفاسي",
+    "سورة الرعد مشاري العفاسي",
+    "سورة إبراهيم مشاري العفاسي",
+    "سورة الحجر مشاري العفاسي",
+    "سورة النحل مشاري العفاسي",
+    "سورة الإسراء مشاري العفاسي",
+    "سورة الكهف مشاري العفاسي",
+    "سورة مريم مشاري العفاسي",
+    "سورة طه مشاري العفاسي",
+    "سورة الأنبياء مشاري العفاسي",
+    "سورة الحج مشاري العفاسي",
+    "سورة المؤمنون مشاري العفاسي",
+    "سورة النور مشاري العفاسي",
+    "سورة الفرقان مشاري العفاسي",
+    "سورة الشعراء مشاري العفاسي",
+    "سورة النمل مشاري العفاسي",
+    "سورة القصص مشاري العفاسي",
+    "سورة العنكبوت مشاري العفاسي",
+    "سورة الروم مشاري العفاسي",
+    "سورة لقمان مشاري العفاسي",
+    "سورة السجدة مشاري العفاسي",
+    "سورة الأحزاب مشاري العفاسي",
+    "سورة سبأ مشاري العفاسي",
+    "سورة فاطر مشاري العفاسي",
+    "سورة يس مشاري العفاسي",
+    "سورة الصافات مشاري العفاسي",
+    "سورة ص مشاري العفاسي",
+    "سورة الزمر مشاري العفاسي",
+    "سورة غافر مشاري العفاسي",
+    "سورة فصلت مشاري العفاسي",
+    "سورة الشورى مشاري العفاسي",
+    "سورة الزخرف مشاري العفاسي",
+    "سورة الدخان مشاري العفاسي",
+    "سورة الجاثية مشاري العفاسي",
+    "سورة الأحقاف مشاري العفاسي",
+    "سورة محمد مشاري العفاسي",
+    "سورة الفتح مشاري العفاسي",
+    "سورة الحجرات مشاري العفاسي",
+    "سورة ق مشاري العفاسي",
+    "سورة الرحمن مشاري العفاسي",
+    "سورة الواقعة مشاري العفاسي",
+    "سورة الحديد مشاري العفاسي",
+    "سورة الحشر مشاري العفاسي",
+    "سورة الملك مشاري العفاسي",
+    "سورة الإنسان مشاري العفاسي",
+    "سورة النبأ مشاري العفاسي",
+    "سورة النازعات مشاري العفاسي",
+    "سورة عبس مشاري العفاسي",
+    "سورة التكوير مشاري العفاسي",
+    "سورة الانفطار مشاري العفاسي",
+    "سورة المطففين مشاري العفاسي",
+    "سورة البروج مشاري العفاسي",
+    "سورة الطارق مشاري العفاسي",
+    "سورة الأعلى مشاري العفاسي",
+    "سورة الغاشية مشاري العفاسي",
+    "سورة الفجر مشاري العفاسي",
+    "سورة البلد مشاري العفاسي",
+    "سورة الشمس مشاري العفاسي",
+    "سورة الليل مشاري العفاسي",
+    "سورة الضحى مشاري العفاسي",
+    "سورة الشرح مشاري العفاسي",
+    "سورة التين مشاري العفاسي",
+    "سورة العلق مشاري العفاسي",
+    "سورة القدر مشاري العفاسي",
+    "سورة البينة مشاري العفاسي",
+    "سورة الزلزلة مشاري العفاسي",
+    "سورة العاديات مشاري العفاسي",
+    "سورة القارعة مشاري العفاسي",
+    "سورة التكاثر مشاري العفاسي",
+    "سورة العصر مشاري العفاسي",
+    "سورة الهمزة مشاري العفاسي",
+    "سورة الفيل مشاري العفاسي",
+    "سورة قريش مشاري العفاسي",
+    "سورة الماعون مشاري العفاسي",
+    "سورة الكوثر مشاري العفاسي",
+    "سورة الكافرون مشاري العفاسي",
+    "سورة النصر مشاري العفاسي",
+    "سورة المسد مشاري العفاسي",
+    "سورة الإخلاص مشاري العفاسي",
+    "سورة الفلق مشاري العفاسي",
+    "سورة الناس مشاري العفاسي",
 ]
 
 URL_RE = re.compile(r"^https?://", re.IGNORECASE)
@@ -187,7 +223,7 @@ def make_ytdl() -> yt_dlp.YoutubeDL:
         return yt_dlp.YoutubeDL(opts)
 
 # =========================
-# موديل التراك
+# Track
 # =========================
 @dataclass
 class Track:
@@ -196,7 +232,7 @@ class Track:
     requester: Optional[discord.Member] = None
 
 # =========================
-# مشغل لكل سيرفر
+# Player per guild
 # =========================
 class GuildPlayer:
     def __init__(self, bot: commands.Bot, guild: discord.Guild):
@@ -213,17 +249,18 @@ class GuildPlayer:
         urls = list(DEFAULT_SONG_URLS)
         if SHUFFLE_ON_REFILL:
             random.shuffle(urls)
+
         for u in urls:
-            await self.queue.put((Track(url=u), channel))
+            q = u.strip()
+            if not URL_RE.match(q):
+                q = f"ytsearch1:{q}"
+            await self.queue.put((Track(url=q), channel))
 
     async def player_loop(self):
         await self.bot.wait_until_ready()
 
         while not self.bot.is_closed():
             self.next_event.clear()
-
-            if self.queue.empty() and self.autorefill:
-                await asyncio.sleep(0.5)
 
             try:
                 track, channel = await self.queue.get()
@@ -240,11 +277,12 @@ class GuildPlayer:
             try:
                 source = await self.create_source(track)
             except Exception as e:
-                await channel.send(f"⚠️ ما قدرت أشغل، رح أتجاوز.\nسبب: `{type(e).__name__}: {e}`")
+                await channel.send(f"⚠️ ما قدرت أشغل هالأغنية، رح أتجاوزها وأكمل.\nسبب: `{type(e).__name__}: {e}`")
                 self.current = None
+
                 if self.queue.empty() and self.autorefill:
                     await self.refill_defaults(channel)
-                    await channel.send("🔁 خلصت/صار خطأ… عبّيت القائمة من جديد وكملت.")
+                    await channel.send("🔁 خلصت القائمة/صار خطأ… عبّيت القائمة من جديد وكملت.")
                 continue
 
             def _after(err: Optional[Exception]):
@@ -262,6 +300,11 @@ class GuildPlayer:
                 await channel.send("🔁 خلصت القائمة… عبّيتها من جديد وكملت.")
 
     async def create_source(self, track: Track) -> discord.PCMVolumeTransformer:
+        # إذا كان mp3 مباشر (بدون yt-dlp)
+        if track.url.lower().endswith(".mp3"):
+            audio = discord.FFmpegPCMAudio(track.url, before_options=FFMPEG_BEFORE, options=FFMPEG_OPTS)
+            return discord.PCMVolumeTransformer(audio, volume=self.volume)
+
         loop = asyncio.get_running_loop()
 
         def _extract():
@@ -296,7 +339,7 @@ class GuildPlayer:
         audio = discord.FFmpegPCMAudio(stream_url, before_options=FFMPEG_BEFORE, options=FFMPEG_OPTS)
         return discord.PCMVolumeTransformer(audio, volume=self.volume)
 
-players: dict[int, GuildPlayer] = {}
+players: Dict[int, GuildPlayer] = {}
 
 def get_player(bot: commands.Bot, guild: discord.Guild) -> GuildPlayer:
     gp = players.get(guild.id)
@@ -306,15 +349,164 @@ def get_player(bot: commands.Bot, guild: discord.Guild) -> GuildPlayer:
     return gp
 
 # =========================
-# البوت + Intents
+# Config (ayah channel)
+# =========================
+def load_config() -> Dict[str, Any]:
+    if not os.path.exists(CONFIG_FILE):
+        return {"guilds": {}}
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"guilds": {}}
+
+def save_config(cfg: Dict[str, Any]) -> None:
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("[CONFIG] save failed:", e)
+
+CONFIG = load_config()
+
+def set_guild_setting(guild_id: int, key: str, value: Any):
+    g = CONFIG.setdefault("guilds", {}).setdefault(str(guild_id), {})
+    g[key] = value
+    save_config(CONFIG)
+
+def get_guild_setting(guild_id: int, key: str, default=None):
+    return CONFIG.get("guilds", {}).get(str(guild_id), {}).get(key, default)
+
+# =========================
+# Discord intents
 # =========================
 intents = discord.Intents.default()
 intents.voice_states = True
-intents.message_content = True  # لحتى !playall يشتغل لازم تفعّل Message Content Intent بالـ Developer Portal
+intents.guilds = True
+if ENABLE_PREFIX_COMMANDS:
+    intents.message_content = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
-_synced = False
 
+# =========================
+# Ayah Template cache + API
+# =========================
+_http: Optional[aiohttp.ClientSession] = None
+_template_bytes: Optional[bytes] = None
+
+async def get_http() -> aiohttp.ClientSession:
+    global _http
+    if _http is None or _http.closed:
+        _http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+    return _http
+
+async def get_template_bytes() -> bytes:
+    global _template_bytes
+    if _template_bytes:
+        return _template_bytes
+    http = await get_http()
+    async with http.get(AYAH_TEMPLATE_URL) as r:
+        r.raise_for_status()
+        _template_bytes = await r.read()
+        return _template_bytes
+
+async def fetch_random_ayah() -> Dict[str, Any]:
+    # alquran.cloud random ayah (مع تلاوة العفاسي)
+    url = "https://api.alquran.cloud/v1/ayah/random/ar.alafasy"
+    http = await get_http()
+    async with http.get(url) as r:
+        r.raise_for_status()
+        data = await r.json()
+        return data["data"]
+
+def shape_arabic(s: str) -> str:
+    # تشكيل + bidi عشان يطلع النص عربي مضبوط بالصور
+    reshaped = arabic_reshaper.reshape(s)
+    return get_display(reshaped)
+
+def wrap_arabic(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> List[str]:
+    words = text.split()
+    lines: List[str] = []
+    cur: List[str] = []
+
+    for w in words:
+        test = (" ".join(cur + [w])).strip()
+        shaped = shape_arabic(test)
+        bbox = draw.textbbox((0, 0), shaped, font=font)
+        width = bbox[2] - bbox[0]
+        if width <= max_width or not cur:
+            cur.append(w)
+        else:
+            lines.append(" ".join(cur))
+            cur = [w]
+
+    if cur:
+        lines.append(" ".join(cur))
+    return lines
+
+async def render_ayah_image(ayah_text: str, ref_text: str) -> bytes:
+    tpl = await get_template_bytes()
+    img = Image.open(io.BytesIO(tpl)).convert("RGBA")
+
+    W, H = img.size
+    # صندوق النص داخل المستطيل الأبيض (نِسَب تقريبية مناسبة للقالب)
+    left = int(W * 0.12)
+    right = int(W * 0.88)
+    top = int(H * 0.36)
+    bottom = int(H * 0.62)
+
+    draw = ImageDraw.Draw(img)
+
+    # Fonts
+    try:
+        font_main = ImageFont.truetype(AR_FONT_PATH, AYAH_FONT_SIZE)
+        font_ref = ImageFont.truetype(AR_FONT_PATH, REF_FONT_SIZE)
+    except Exception:
+        font_main = ImageFont.load_default()
+        font_ref = ImageFont.load_default()
+
+    max_width = right - left
+
+    # لف النص على سطور
+    lines = wrap_arabic(draw, ayah_text, font_main, max_width)
+    # حد أقصى سطور حتى ما يطلع برا
+    lines = lines[:4]
+
+    # احسب الارتفاع الكلي
+    line_heights = []
+    for ln in lines:
+        shaped_ln = shape_arabic(ln)
+        bbox = draw.textbbox((0, 0), shaped_ln, font=font_main)
+        line_heights.append(bbox[3] - bbox[1])
+
+    total_text_h = sum(line_heights) + (len(lines) - 1) * 10
+
+    # نقطة بداية وسط الصندوق
+    y = top + max(0, ((bottom - top) - total_text_h) // 2)
+
+    for i, ln in enumerate(lines):
+        shaped_ln = shape_arabic(ln)
+        bbox = draw.textbbox((0, 0), shaped_ln, font=font_main)
+        w = bbox[2] - bbox[0]
+        x = left + ((right - left) - w) // 2
+        draw.text((x, y), shaped_ln, font=font_main, fill=(40, 40, 40, 255))
+        y += line_heights[i] + 10
+
+    # المرجع أسفل
+    ref_shaped = shape_arabic(ref_text)
+    bbox = draw.textbbox((0, 0), ref_shaped, font=font_ref)
+    rw = bbox[2] - bbox[0]
+    rx = left + ((right - left) - rw) // 2
+    ry = bottom + int(H * 0.02)
+    draw.text((rx, ry), ref_shaped, font=font_ref, fill=(90, 90, 90, 255))
+
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
+
+# =========================
+# Voice helpers
+# =========================
 async def ensure_voice_ctx(ctx: commands.Context) -> discord.VoiceClient:
     if not ctx.author.voice or not ctx.author.voice.channel:
         raise commands.CommandError("لازم تكون داخل روم صوت أولاً.")
@@ -324,177 +516,257 @@ async def ensure_voice_ctx(ctx: commands.Context) -> discord.VoiceClient:
     return await ctx.author.voice.channel.connect()
 
 async def ensure_voice_interaction(inter: discord.Interaction) -> discord.VoiceClient:
-    user = inter.user
-    if not isinstance(user, discord.Member) or not user.voice or not user.voice.channel:
+    if not inter.user or not isinstance(inter.user, discord.Member):
+        raise app_commands.AppCommandError("لازم تكون داخل سيرفر.")
+    member = inter.user
+    if not member.voice or not member.voice.channel:
         raise app_commands.AppCommandError("لازم تكون داخل روم صوت أولاً.")
     vc = inter.guild.voice_client if inter.guild else None
     if vc and vc.is_connected():
         return vc
-    return await user.voice.channel.connect()
+    return await member.voice.channel.connect()
 
+# =========================
+# Events
+# =========================
 @bot.event
 async def on_ready():
-    global _synced
     print(f"[READY] {bot.user} is online.")
 
-    # حالة البوت حتى الناس تعرف
     try:
-        await bot.change_presence(activity=discord.Game(name="!playall أو /playall"))
+        await bot.change_presence(activity=discord.Game(name=PRESENCE_TEXT))
     except Exception:
         pass
 
-    if not _synced:
-        try:
-            if SYNC_GUILD_ID.isdigit():
-                g = discord.Object(id=int(SYNC_GUILD_ID))
-                await bot.tree.sync(guild=g)
-                print(f"[SYNC] Slash commands synced to guild {SYNC_GUILD_ID} (سريع).")
-            else:
-                await bot.tree.sync()
-                print("[SYNC] Slash commands synced globally (قد تأخذ وقت بالظهور).")
-        except Exception as e:
-            print(f"[SYNC ERROR] {e}")
-        _synced = True
+    # Sync slash commands
+    try:
+        if SYNC_GUILD_ID.isdigit():
+            gobj = discord.Object(id=int(SYNC_GUILD_ID))
+            await bot.tree.sync(guild=gobj)
+            print(f"[SYNC] synced to guild {SYNC_GUILD_ID}")
+        else:
+            await bot.tree.sync()
+            print("[SYNC] synced globally")
+    except Exception as e:
+        print("[SYNC] failed:", e)
 
-    # Auto join/play (اختياري)
-    if AUTO_JOIN_VOICE_CHANNEL_ID and AUTO_JOIN_VOICE_CHANNEL_ID.isdigit():
-        vc_id = int(AUTO_JOIN_VOICE_CHANNEL_ID)
+    if not pick_js_runtimes():
+        print("[WARN] ما لقيت Deno/Node. إذا واجهت مشاكل يوتيوب، ثبت Deno/Node.")
+
+    # تشغيل حلقة إرسال الآيات
+    if not ayah_poster.is_running():
+        ayah_poster.start()
+
+    # Auto-join (اختياري)
+    if AUTO_JOIN_VOICE_CHANNEL_ID:
         for g in bot.guilds:
-            ch = g.get_channel(vc_id)
+            ch = g.get_channel(AUTO_JOIN_VOICE_CHANNEL_ID)
             if isinstance(ch, discord.VoiceChannel):
                 try:
                     await ch.connect()
-                    print(f"[AUTO] joined voice channel: {ch.name} in {g.name}")
-                    if AUTO_PLAY_ON_READY:
-                        # بدنا روم نصي للإشعارات، خليه أول روم متاح
-                        txt = next((c for c in g.text_channels if c.permissions_for(g.me).send_messages), None)
-                        if txt:
-                            player = get_player(bot, g)
-                            await player.refill_defaults(txt)
-                            await txt.send("✅ Auto: شغّلت القائمة تلقائياً. اكتب /playall أو !playall لإعادة التحميل.")
+                    print(f"[AUTO] joined: {ch.name} in {g.name}")
                 except Exception as e:
-                    print(f"[AUTO] failed to join/play: {e}")
+                    print(f"[AUTO] failed: {e}")
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    # أول ما ينضاف لسيرفر جديد
+    print(f"[GUILD] joined: {guild.name} ({guild.id})")
 
 # =========================
-# Prefix Commands ( ! )
+# Ayah poster loop
 # =========================
-@bot.command()
-async def join(ctx: commands.Context):
-    vc = await ensure_voice_ctx(ctx)
-    await ctx.reply(f"✅ دخلت: **{vc.channel}**")
+@tasks.loop(minutes=POST_INTERVAL_MINUTES)
+async def ayah_poster():
+    # يرسل لكل سيرفر مفعل عليه
+    for g in bot.guilds:
+        enabled = bool(get_guild_setting(g.id, "ayah_enabled", False))
+        ch_id = get_guild_setting(g.id, "ayah_channel_id", None)
+        if not enabled or not ch_id:
+            continue
 
-@bot.command()
-async def leave(ctx: commands.Context):
-    vc = ctx.guild.voice_client
+        ch = g.get_channel(int(ch_id))
+        if not isinstance(ch, discord.TextChannel):
+            continue
+
+        try:
+            ayah = await fetch_random_ayah()
+            text = ayah.get("text", "").strip()
+            surah = ayah.get("surah", {}) or {}
+            surah_name = surah.get("name", "سورة")
+            num_in_surah = ayah.get("numberInSurah", "?")
+
+            ref = f"{surah_name} — آية {num_in_surah}"
+            img_bytes = await render_ayah_image(text, ref)
+
+            file = discord.File(io.BytesIO(img_bytes), filename="ayah.png")
+            await ch.send(file=file)
+        except Exception as e:
+            print("[AYAH] failed:", e)
+
+@ayah_poster.before_loop
+async def before_ayah_poster():
+    await bot.wait_until_ready()
+
+# =========================
+# Prefix commands
+# =========================
+if ENABLE_PREFIX_COMMANDS:
+
+    @bot.command()
+    async def join(ctx: commands.Context):
+        vc = await ensure_voice_ctx(ctx)
+        await ctx.reply(f"✅ دخلت: **{vc.channel}**")
+
+    @bot.command()
+    async def leave(ctx: commands.Context):
+        vc = ctx.guild.voice_client
+        if vc and vc.is_connected():
+            await vc.disconnect()
+            await ctx.reply("👋 طلعت من الروم.")
+        else:
+            await ctx.reply("أنا أصلاً مو داخل روم.")
+
+    @bot.command()
+    async def play(ctx: commands.Context, *, query: str):
+        await ensure_voice_ctx(ctx)
+        player = get_player(bot, ctx.guild)
+
+        q = query.strip()
+        if not URL_RE.match(q):
+            q = f"ytsearch1:{q}"
+
+        await player.queue.put((Track(url=q, requester=ctx.author), ctx.channel))
+        await ctx.reply(f"✅ انضافت للطابور. (المتبقي: **{player.queue.qsize()}**)")
+
+    @bot.command()
+    async def playall(ctx: commands.Context):
+        await ensure_voice_ctx(ctx)
+        player = get_player(bot, ctx.guild)
+        await player.refill_defaults(ctx.channel)
+        await ctx.reply(f"✅ تم تحميل **{len(DEFAULT_SONG_URLS)}** للتشغيل. رح يكمل 24/7.")
+
+    @bot.command()
+    async def skip(ctx: commands.Context):
+        vc = ctx.guild.voice_client
+        if vc and (vc.is_playing() or vc.is_paused()):
+            vc.stop()
+            await ctx.reply("⏭️ تم السكيب.")
+        else:
+            await ctx.reply("ما في شي شغال.")
+
+    @bot.command()
+    async def now(ctx: commands.Context):
+        player = get_player(bot, ctx.guild)
+        if player.current:
+            await ctx.reply(f"🎶 الآن: **{player.current.title}**")
+        else:
+            await ctx.reply("ما في شي شغال حالياً.")
+
+    @bot.command()
+    async def auto(ctx: commands.Context, mode: str):
+        player = get_player(bot, ctx.guild)
+        mode = mode.lower().strip()
+        if mode in ("on", "1", "true", "yes"):
+            player.autorefill = True
+            await ctx.reply("✅ Auto refill: ON")
+        elif mode in ("off", "0", "false", "no"):
+            player.autorefill = False
+            await ctx.reply("✅ Auto refill: OFF")
+        else:
+            await ctx.reply("استخدم: `!auto on` أو `!auto off`")
+
+    @bot.command(name="setayahchannel")
+    async def setayahchannel(ctx: commands.Context, channel: Optional[discord.TextChannel] = None):
+        channel = channel or ctx.channel
+        set_guild_setting(ctx.guild.id, "ayah_channel_id", channel.id)
+        await ctx.reply(f"✅ تم تعيين قناة الآيات: {channel.mention}")
+
+    @bot.command(name="ayah")
+    async def ayah_cmd(ctx: commands.Context, mode: Optional[str] = None):
+        if mode and mode.lower() in ("on", "enable"):
+            set_guild_setting(ctx.guild.id, "ayah_enabled", True)
+            set_guild_setting(ctx.guild.id, "ayah_channel_id", ctx.channel.id)
+            await ctx.reply("✅ تم تفعيل إرسال الآيات كل 30 دقيقة في هذه القناة.")
+            return
+        if mode and mode.lower() in ("off", "disable"):
+            set_guild_setting(ctx.guild.id, "ayah_enabled", False)
+            await ctx.reply("🛑 تم إيقاف إرسال الآيات.")
+            return
+
+        # إرسال آية الآن
+        ayah = await fetch_random_ayah()
+        text = (ayah.get("text") or "").strip()
+        surah = ayah.get("surah", {}) or {}
+        surah_name = surah.get("name", "سورة")
+        num_in_surah = ayah.get("numberInSurah", "?")
+        ref = f"{surah_name} — آية {num_in_surah}"
+        img_bytes = await render_ayah_image(text, ref)
+        await ctx.send(file=discord.File(io.BytesIO(img_bytes), filename="ayah.png"))
+
+# =========================
+# Slash commands (تظهر بقسم Commands بالبروفايل)
+# =========================
+@bot.tree.command(name="join", description="يدخل روم الصوت")
+async def slash_join(inter: discord.Interaction):
+    await ensure_voice_interaction(inter)
+    await inter.response.send_message("✅ دخلت الروم الصوتي.", ephemeral=True)
+
+@bot.tree.command(name="leave", description="يطلع من روم الصوت")
+async def slash_leave(inter: discord.Interaction):
+    vc = inter.guild.voice_client if inter.guild else None
     if vc and vc.is_connected():
         await vc.disconnect()
-        await ctx.reply("👋 طلعت من الروم.")
+        await inter.response.send_message("👋 طلعت من الروم.", ephemeral=True)
     else:
-        await ctx.reply("أنا أصلاً مو داخل روم.")
+        await inter.response.send_message("أنا أصلاً مو داخل روم.", ephemeral=True)
 
-@bot.command()
-async def play(ctx: commands.Context, *, query: str):
-    await ensure_voice_ctx(ctx)
-    player = get_player(bot, ctx.guild)
+@bot.tree.command(name="playall", description="تشغيل القرآن 24/7 (يعبّي قائمة التشغيل)")
+async def slash_playall(inter: discord.Interaction):
+    vc = await ensure_voice_interaction(inter)
+    player = get_player(bot, inter.guild)
 
-    q = query.strip()
-    if not URL_RE.match(q) and not q.lower().startswith("ytsearch"):
-        q = f"ytsearch1:{q}"
+    # نرسل الرد في نفس الشات
+    await inter.response.send_message(f"✅ جاهز! تقدر تكتب: `{PREFIX}playall` أو تستخدم هذا الأمر.", ephemeral=True)
 
-    await player.queue.put((Track(url=q, requester=ctx.author), ctx.channel))
-    await ctx.reply(f"✅ انضافت للطابور. (المتبقي: **{player.queue.qsize()}**)")
+    # ماكو ctx هنا، نخلي الرسائل تروح لقناة الأمر الحالي
+    if isinstance(inter.channel, discord.TextChannel):
+        await player.refill_defaults(inter.channel)
+        await inter.channel.send(f"✅ تم تحميل **{len(DEFAULT_SONG_URLS)}** للتشغيل. رح يكمل 24/7.")
 
-@bot.command()
-async def playall(ctx: commands.Context):
-    await ensure_voice_ctx(ctx)
-    player = get_player(bot, ctx.guild)
+@bot.tree.command(name="setayahchannel", description="تعيين قناة إرسال الآيات/الأذكار")
+@app_commands.describe(channel="اختار قناة النص")
+async def slash_setayahchannel(inter: discord.Interaction, channel: discord.TextChannel):
+    set_guild_setting(inter.guild.id, "ayah_channel_id", channel.id)
+    await inter.response.send_message(f"✅ تم تعيين قناة الآيات: {channel.mention}", ephemeral=True)
 
-    await player.refill_defaults(ctx.channel)
-    await ctx.reply(f"✅ تم تحميل **{len(DEFAULT_SONG_URLS)}** عنصر للطابور. رح يكمل تلقائيًا 🔁")
-
-@bot.command()
-async def skip(ctx: commands.Context):
-    vc = ctx.guild.voice_client
-    if vc and (vc.is_playing() or vc.is_paused()):
-        vc.stop()
-        await ctx.reply("⏭️ تم السكيب.")
-    else:
-        await ctx.reply("ما في شي شغال.")
-
-@bot.command()
-async def now(ctx: commands.Context):
-    player = get_player(bot, ctx.guild)
-    if player.current:
-        await ctx.reply(f"🎶 الآن: **{player.current.title}**")
-    else:
-        await ctx.reply("ما في شي شغال حالياً.")
-
-@bot.command()
-async def auto(ctx: commands.Context, mode: str):
-    player = get_player(bot, ctx.guild)
-    mode = mode.lower().strip()
-    if mode in ("on", "1", "true", "yes"):
-        player.autorefill = True
-        await ctx.reply("✅ Auto refill: ON")
-    elif mode in ("off", "0", "false", "no"):
-        player.autorefill = False
-        await ctx.reply("✅ Auto refill: OFF")
-    else:
-        await ctx.reply("استخدم: `!auto on` أو `!auto off`")
-
-# =========================
-# Slash Commands ( / ) <-- هي اللي بتظهر بواجهة البوت كأزرار
-# =========================
-@bot.tree.command(name="playall", description="تحميل قائمة القرآن الافتراضية وتشغيلها تلقائياً")
-async def slash_playall(interaction: discord.Interaction):
-    await ensure_voice_interaction(interaction)
-    player = get_player(bot, interaction.guild)
-
-    # نحتاج قناة نصية للرسائل
-    channel = interaction.channel
-    if not isinstance(channel, discord.TextChannel):
-        await interaction.response.send_message("❌ استعمل الأمر داخل روم نصي.", ephemeral=True)
+@bot.tree.command(name="ayah", description="إرسال آية الآن / تشغيل الإرسال التلقائي")
+@app_commands.describe(mode="on/off أو اتركها فارغة لإرسال آية الآن")
+async def slash_ayah(inter: discord.Interaction, mode: Optional[str] = None):
+    if mode and mode.lower() in ("on", "enable"):
+        set_guild_setting(inter.guild.id, "ayah_enabled", True)
+        if isinstance(inter.channel, discord.TextChannel):
+            set_guild_setting(inter.guild.id, "ayah_channel_id", inter.channel.id)
+        await inter.response.send_message("✅ تم تفعيل إرسال الآيات كل 30 دقيقة في هذه القناة.", ephemeral=True)
         return
 
-    await player.refill_defaults(channel)
-    await interaction.response.send_message(f"✅ تم تحميل **{len(DEFAULT_SONG_URLS)}** عنصر للطابور. 🔁")
+    if mode and mode.lower() in ("off", "disable"):
+        set_guild_setting(inter.guild.id, "ayah_enabled", False)
+        await inter.response.send_message("🛑 تم إيقاف إرسال الآيات.", ephemeral=True)
+        return
 
-@bot.tree.command(name="join", description="يدخل البوت لرومك الصوتي")
-async def slash_join(interaction: discord.Interaction):
-    vc = await ensure_voice_interaction(interaction)
-    await interaction.response.send_message(f"✅ دخلت: **{vc.channel}**")
+    ayah = await fetch_random_ayah()
+    text = (ayah.get("text") or "").strip()
+    surah = ayah.get("surah", {}) or {}
+    surah_name = surah.get("name", "سورة")
+    num_in_surah = ayah.get("numberInSurah", "?")
+    ref = f"{surah_name} — آية {num_in_surah}"
+    img_bytes = await render_ayah_image(text, ref)
 
-@bot.tree.command(name="leave", description="يطلع البوت من الروم الصوتي")
-async def slash_leave(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client if interaction.guild else None
-    if vc and vc.is_connected():
-        await vc.disconnect()
-        await interaction.response.send_message("👋 طلعت من الروم.")
-    else:
-        await interaction.response.send_message("أنا أصلاً مو داخل روم.")
-
-@bot.tree.command(name="now", description="يعرض ايش شغال الآن")
-async def slash_now(interaction: discord.Interaction):
-    player = get_player(bot, interaction.guild)
-    if player.current:
-        await interaction.response.send_message(f"🎶 الآن: **{player.current.title}**")
-    else:
-        await interaction.response.send_message("ما في شي شغال حالياً.")
-
-@bot.tree.command(name="help", description="شرح سريع للأوامر")
-async def slash_help(interaction: discord.Interaction):
-    msg = (
-        "**أوامر التشغيل:**\n"
-        f"- `{PREFIX}playall` أو `/playall` لتشغيل قائمة القرآن 24/7\n"
-        f"- `{PREFIX}join` أو `/join` دخول الروم\n"
-        f"- `{PREFIX}leave` أو `/leave` خروج\n"
-        f"- `{PREFIX}skip` لتخطي\n"
-        f"- `{PREFIX}now` أو `/now` الآن\n"
-    )
-    await interaction.response.send_message(msg, ephemeral=True)
+    file = discord.File(io.BytesIO(img_bytes), filename="ayah.png")
+    await inter.response.send_message(file=file)
 
 # =========================
-# تشغيل
+# Run
 # =========================
 bot.run(TOKEN)
-
