@@ -2,6 +2,12 @@ discord.py
 python-dotenv
 yt-dlp
 PyNaCl
+aiohttp
+Pillow
+arabic-reshaper
+python-bidi
+
+
 
 
 
