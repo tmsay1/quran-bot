@@ -1,341 +1,290 @@
 import os
-import re
 import asyncio
-import shutil
-import random
-from dataclasses import dataclass
-from typing import Optional, List, Tuple
-
+import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands
-from dotenv import load_dotenv
-import yt_dlp
 
-# =========================
-# ضع التوكن هنا (لا تنشره)
-# =========================
-BOT_TOKEN = "" 
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+SUPPORT_INVITE = os.getenv("SUPPORT_INVITE", "https://discord.gg/EzE7W8TJJP")
 
-# (اختياري وأفضل): تقدر تحط التوكن بملف .env بدل الكود
-# DISCORD_TOKEN=xxxxx
-load_dotenv()
-TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
-if not TOKEN:
-    raise SystemExit("DISCORD_TOKEN is missing. Set it in environment variables.")
+# لو بدك تفعيل أوامر ! (اختياري)
+ENABLE_PREFIX_COMMANDS = os.getenv("ENABLE_PREFIX_COMMANDS", "0") == "1"
 
+intents = discord.Intents.default()
+intents.guilds = True
+intents.voice_states = True
+if ENABLE_PREFIX_COMMANDS:
+    intents.message_content = True  # لازم تفعّله من Developer Portal كمان
 
-PREFIX = (os.getenv("PREFIX") or "!").strip() or "!"
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-# =========================
-# إعدادات التشغيل التلقائي
-# =========================
-AUTO_REFILL_DEFAULT_LIST = True   # إذا خلصت الأغاني يعبيها من جديد ويكمل
-SHUFFLE_ON_REFILL = False         # إذا True بيشغلهم عشوائي
-# لتشغيل تلقائي عند الإقلاع (اختياري): حط رقم روم الصوت
-AUTO_JOIN_VOICE_CHANNEL_ID = None  # مثال: 123456789012345678
+# ========= Quran helpers =========
+API_BASE = "https://api.alquran.cloud/v1"
 
-# =========================
-# روابط الأغاني داخل الكود
-# =========================
-DEFAULT_SONG_URLS = [
-    "https://youtu.be/9k1U0aGQRNA?si=QEuagBJ4xXZc11G6",
-    "https://youtu.be/nmCuMB2GQHQ?si=loMcI-MYmSxVQN2D",
-    "https://youtu.be/KN8iHcilfdY?si=5ihc6sPyou3Fjb7L",
-    "https://youtu.be/TCE5P-AhEck?si=q-l1a1bzhE2l6XEO",
-    "https://youtu.be/HzXDdrKhvjg?si=xkSfk1Cg4NwDhML9",
-    "https://youtu.be/8poX5OD2BR0?si=Vmo-5OXYYnpCrQq9",
-    "https://youtu.be/JglxgL9juOA?si=kbyopoeajy8HgGt4",
-    "https://www.youtube.com/live/F_BVjvBksOw?si=27A7n2W9wVWuD4bE",
-    "https://youtu.be/p35TFiz_PDQ?si=OWTCmZ8Ps97tlCpV",
-    "https://youtu.be/fRkVxypqpHA?si=c4E6XVbHPV0PRwk1",
-]
+# اختيار قارئ (EveryAyah dataset folder)
+RECITER_FOLDER = os.getenv("RECITER_FOLDER", "Alafasy_128kbps")
 
-
-
-URL_RE = re.compile(r"^https?://", re.IGNORECASE)
-
-# =========================
-# yt-dlp + ffmpeg
-# =========================
-def has_cmd(cmd: str) -> bool:
-    return shutil.which(cmd) is not None
-
-def pick_js_runtimes() -> List[str]:
-    r = []
-    if has_cmd("deno"):
-        r.append("deno")
-    if has_cmd("node"):
-        r.append("node")
-    return r
-
-BASE_YTDL_OPTS = {
-    "format": "bestaudio/best",
-    "quiet": True,
-    "no_warnings": True,
-    "ignoreerrors": True,
-    "default_search": "ytsearch",
-    "noplaylist": False,
-    "source_address": "0.0.0.0",
-    "retries": 5,
-    "fragment_retries": 5,
-    "extractor_retries": 5,
-    "socket_timeout": 15,
-    # يساعد مع تغييرات يوتيوب
-    "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
-}
-
+# FFmpeg reconnect options (مهمة للروابط)
 FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 FFMPEG_OPTS = "-vn"
 
-def make_ytdl() -> yt_dlp.YoutubeDL:
-    opts = dict(BASE_YTDL_OPTS)
-    runtimes = pick_js_runtimes()
-    if runtimes:
-        opts["js_runtimes"] = runtimes
-    try:
-        return yt_dlp.YoutubeDL(opts)
-    except Exception:
-        # لو نسخة yt-dlp ما تدعم js_runtimes
-        opts.pop("js_runtimes", None)
-        return yt_dlp.YoutubeDL(opts)
+session: aiohttp.ClientSession | None = None
+surah_meta_cache = {}  # surah_number -> {"numberOfAyahs": int, "englishName": str, ...}
 
-# =========================
-# موديل الأغاني
-# =========================
-@dataclass
-class Track:
-    url: str
-    title: str = "Unknown"
-    requester: Optional[discord.Member] = None
+def ayah_id_6digits(surah: int, ayah: int) -> str:
+    # 1:1 -> 001001
+    return f"{surah:03d}{ayah:03d}"
 
-# =========================
-# مشغل لكل سيرفر
-# =========================
+def everyayah_url(surah: int, ayah: int) -> str:
+    return f"https://everyayah.com/data/{RECITER_FOLDER}/{ayah_id_6digits(surah, ayah)}.mp3"
+
+async def fetch_json(url: str):
+    global session
+    if session is None:
+        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25))
+    async with session.get(url) as r:
+        r.raise_for_status()
+        return await r.json()
+
+async def get_surah_meta(surah: int):
+    if surah in surah_meta_cache:
+        return surah_meta_cache[surah]
+    data = await fetch_json(f"{API_BASE}/surah/{surah}")
+    meta = data["data"]
+    surah_meta_cache[surah] = meta
+    return meta
+
+async def get_ayah_text(surah: int, ayah: int) -> str:
+    # نص عثماني
+    data = await fetch_json(f"{API_BASE}/ayah/{surah}:{ayah}/quran-uthmani")
+    return data["data"]["text"]
+
+# ========= Voice queue per guild =========
 class GuildPlayer:
-    def __init__(self, bot: commands.Bot, guild: discord.Guild):
-        self.bot = bot
-        self.guild = guild
-        self.queue: asyncio.Queue[Tuple[Track, discord.TextChannel]] = asyncio.Queue()
-        self.next_event = asyncio.Event()
-        self.current: Optional[Track] = None
-        self.volume = 0.6
-        self.autorefill = AUTO_REFILL_DEFAULT_LIST
-        self.task = asyncio.create_task(self.player_loop())
+    def __init__(self):
+        self.queue: asyncio.Queue[str] = asyncio.Queue()
+        self.now_playing: str | None = None
+        self.lock = asyncio.Lock()
 
-    async def refill_defaults(self, channel: discord.TextChannel):
-        urls = list(DEFAULT_SONG_URLS)
-        if SHUFFLE_ON_REFILL:
-            random.shuffle(urls)
-        for u in urls:
-            await self.queue.put((Track(url=u), channel))
+guild_players: dict[int, GuildPlayer] = {}
 
-    async def player_loop(self):
-        await self.bot.wait_until_ready()
+def get_player(guild_id: int) -> GuildPlayer:
+    if guild_id not in guild_players:
+        guild_players[guild_id] = GuildPlayer()
+    return guild_players[guild_id]
 
-        while not self.bot.is_closed():
-            self.next_event.clear()
+async def ensure_voice(interaction: discord.Interaction) -> discord.VoiceClient | None:
+    if not interaction.guild:
+        return None
+    if not interaction.user or not isinstance(interaction.user, discord.Member):
+        return None
 
-            # إذا الطابور فضي + autorefill مفعّل => عبّي تلقائي
-            if self.queue.empty() and self.autorefill:
-                # حاول نلاقي آخر روم نصي للبث: إذا ما في، ما نعرف وين نرسل رسائل
-                # فبنطر لين يجي أمر.
-                await asyncio.sleep(0.5)
+    member: discord.Member = interaction.user
+    if not member.voice or not member.voice.channel:
+        await interaction.followup.send("لازم تكون داخل روم صوتي أولاً 🎧", ephemeral=True)
+        return None
 
-            try:
-                track, channel = await self.queue.get()
-            except Exception:
-                continue
-
-            self.current = track
-            vc = self.guild.voice_client
-
-            if vc is None or not vc.is_connected():
-                self.current = None
-                continue
-
-            try:
-                source = await self.create_source(track)
-            except Exception as e:
-                # ما نوقف! نسكّب ونكمّل
-                await channel.send(f"⚠️ ما قدرت أشغل هالأغنية، رح أتجاوزها وأكمل.\nسبب: `{type(e).__name__}: {e}`")
-                self.current = None
-
-                # إذا صار الطابور فاضي بعد السكيب و autorefill شغال
-                if self.queue.empty() and self.autorefill:
-                    await self.refill_defaults(channel)
-                    await channel.send("🔁 خلصت القائمة/صار خطأ… عبّيت القائمة من جديد وكملت.")
-                continue
-
-            def _after(err: Optional[Exception]):
-                if err:
-                    print(f"[AFTER ERROR] {err}")
-                self.bot.loop.call_soon_threadsafe(self.next_event.set)
-
-            vc.play(source, after=_after)
-            await channel.send(f"▶️ **Now Playing:** {track.title}")
-            await self.next_event.wait()
-            self.current = None
-
-            # إذا خلصت الأغاني: عبّي تلقائي
-            if self.queue.empty() and self.autorefill:
-                await self.refill_defaults(channel)
-                await channel.send("🔁 خلصت القائمة… عبّيتها من جديد وكملت.")
-
-    async def create_source(self, track: Track) -> discord.PCMVolumeTransformer:
-        loop = asyncio.get_running_loop()
-
-        def _extract():
-            with make_ytdl() as ydl:
-                return ydl.extract_info(track.url, download=False)
-
-        info = await loop.run_in_executor(None, _extract)
-        if not info:
-            raise RuntimeError("فشل استخراج معلومات من yt-dlp.")
-
-        # لو رجع playlist/بحث
-        if "entries" in info and info["entries"]:
-            entry = next((e for e in info["entries"] if e), None)
-            if not entry:
-                raise RuntimeError("ما لقيت نتيجة صالحة.")
-            vid_url = entry.get("webpage_url") or entry.get("url")
-            if not vid_url:
-                vid = entry.get("id")
-                if not vid:
-                    raise RuntimeError("نتيجة بدون رابط.")
-                vid_url = f"https://www.youtube.com/watch?v={vid}"
-            track.url = vid_url
-            track.title = entry.get("title") or track.title
-            return await self.create_source(track)
-
-        track.title = info.get("title") or track.title
-        stream_url = info.get("url")
-        if not stream_url and info.get("requested_formats"):
-            stream_url = info["requested_formats"][0].get("url")
-        if not stream_url:
-            raise RuntimeError("ما حصلت رابط ستريم صالح.")
-
-        audio = discord.FFmpegPCMAudio(
-            stream_url,
-            before_options=FFMPEG_BEFORE,
-            options=FFMPEG_OPTS
-        )
-        return discord.PCMVolumeTransformer(audio, volume=self.volume)
-
-players: dict[int, GuildPlayer] = {}
-
-def get_player(bot: commands.Bot, guild: discord.Guild) -> GuildPlayer:
-    gp = players.get(guild.id)
-    if not gp:
-        gp = GuildPlayer(bot, guild)
-        players[guild.id] = gp
-    return gp
-
-# =========================
-# البوت + Intents
-# =========================
-intents = discord.Intents.default()
-intents.message_content = True
-intents.voice_states = True
-
-bot = commands.Bot(command_prefix=PREFIX, intents=intents)
-
-async def ensure_voice(ctx: commands.Context) -> discord.VoiceClient:
-    if not ctx.author.voice or not ctx.author.voice.channel:
-        raise commands.CommandError("لازم تكون داخل روم صوت أولاً.")
-    vc = ctx.guild.voice_client
+    vc = interaction.guild.voice_client
     if vc and vc.is_connected():
+        # لو البوت بروم ثاني، انقله
+        if vc.channel != member.voice.channel:
+            await vc.move_to(member.voice.channel)
         return vc
-    return await ctx.author.voice.channel.connect()
 
+    return await member.voice.channel.connect()
+
+async def play_loop(guild: discord.Guild):
+    """
+    Loop يشتغل مرة واحدة لكل سيرفر.
+    """
+    player = get_player(guild.id)
+
+    async with player.lock:
+        vc = guild.voice_client
+        if not vc or not vc.is_connected():
+            return
+
+        while True:
+            url = await player.queue.get()
+            player.now_playing = url
+
+            done = asyncio.Event()
+
+            def _after(err: Exception | None):
+                done.set()
+
+            source = discord.FFmpegPCMAudio(
+                url,
+                before_options=FFMPEG_BEFORE,
+                options=FFMPEG_OPTS
+            )
+            vc.play(source, after=_after)
+            await done.wait()
+
+            # إذا خلصت الطابور، اطلع من الروم
+            if player.queue.empty():
+                await asyncio.sleep(2)
+                if guild.voice_client and guild.voice_client.is_connected():
+                    try:
+                        await guild.voice_client.disconnect()
+                    except:
+                        pass
+                player.now_playing = None
+                break
+
+# ========= Slash Commands =========
 @bot.event
 async def on_ready():
-    print(f"[READY] {bot.user} is online.")
-    if not pick_js_runtimes():
-        print("[WARN] ما لقيت Deno/Node. ثبت Deno لتفادي مشاكل يوتيوب الحديثة.")
-    # Auto-join option (اختياري)
-    if AUTO_JOIN_VOICE_CHANNEL_ID:
-        for g in bot.guilds:
-            ch = g.get_channel(AUTO_JOIN_VOICE_CHANNEL_ID)
-            if isinstance(ch, discord.VoiceChannel):
-                try:
-                    await ch.connect()
-                    print(f"[AUTO] joined voice channel: {ch.name} in {g.name}")
-                except Exception as e:
-                    print(f"[AUTO] failed to join: {e}")
+    print(f"Logged in as {bot.user} (id={bot.user.id})")
+    try:
+        guild_id = os.getenv("GUILD_ID")
+        if guild_id:
+            g = discord.Object(id=int(guild_id))
+            await bot.tree.sync(guild=g)
+            print("Synced commands to one guild.")
+        else:
+            await bot.tree.sync()
+            print("Synced global commands.")
+    except Exception as e:
+        print("Sync error:", e)
 
-# =========================
-# أوامر
-# =========================
-@bot.command()
-async def join(ctx: commands.Context):
-    vc = await ensure_voice(ctx)
-    await ctx.reply(f"✅ دخلت: **{vc.channel}**")
+@bot.tree.command(name="help", description="شرح أوامر البوت")
+async def help_cmd(interaction: discord.Interaction):
+    embed = discord.Embed(title="📖 أوامر بوت القرآن", description="أهم الأوامر:", color=0x2ecc71)
+    embed.add_field(name="/join", value="يدخل البوت للروم الصوتي اللي انت فيه", inline=False)
+    embed.add_field(name="/play_surah", value="يشغل سورة كاملة (بشكل آيات متتالية)", inline=False)
+    embed.add_field(name="/play_ayah", value="يشغل آية محددة", inline=False)
+    embed.add_field(name="/ayah", value="يعرض نص آية (وممكن تشغلها)", inline=False)
+    embed.add_field(name="/stop", value="يوقف التشغيل ويفضي الطابور", inline=False)
+    embed.add_field(name="/support", value="سيرفر الدعم", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.command()
-async def leave(ctx: commands.Context):
-    vc = ctx.guild.voice_client
-    if vc and vc.is_connected():
-        await vc.disconnect()
-        await ctx.reply("👋 طلعت من الروم.")
-    else:
-        await ctx.reply("أنا أصلاً مو داخل روم.")
+@bot.tree.command(name="support", description="رابط سيرفر الدعم")
+async def support_cmd(interaction: discord.Interaction):
+    await interaction.response.send_message(f"سيرفر الدعم: {SUPPORT_INVITE}", ephemeral=True)
 
-@bot.command()
-async def play(ctx: commands.Context, *, query: str):
-    await ensure_voice(ctx)
-    player = get_player(bot, ctx.guild)
+@bot.tree.command(name="join", description="يدخل رومك الصوتي")
+async def join_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    vc = await ensure_voice(interaction)
+    if vc:
+        await interaction.followup.send("تمام دخلت للروم 🎧", ephemeral=True)
 
-    q = query.strip()
-    if not URL_RE.match(q):
-        q = f"ytsearch1:{q}"
+@bot.tree.command(name="stop", description="إيقاف التشغيل وتفريغ الطابور")
+async def stop_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    if not interaction.guild:
+        return await interaction.followup.send("هذا الأمر داخل السيرفر فقط.", ephemeral=True)
 
-    await player.queue.put((Track(url=q, requester=ctx.author), ctx.channel))
-    await ctx.reply(f"✅ انضافت للطابور. (المتبقي: **{player.queue.qsize()}**)")
-
-@bot.command()
-async def playall(ctx: commands.Context):
-    """يشغل روابطك (ويكمل تلقائي + يعيد تعبئة القائمة عند الانتهاء)."""
-    await ensure_voice(ctx)
-    player = get_player(bot, ctx.guild)
-
-    await player.refill_defaults(ctx.channel)
-    await ctx.reply(f"✅ تم تحميل **{len(DEFAULT_SONG_URLS)}** أغنية للطابور. رح يبدّل تلقائيًا.")
-
-@bot.command()
-async def skip(ctx: commands.Context):
-    vc = ctx.guild.voice_client
-    if vc and (vc.is_playing() or vc.is_paused()):
+    player = get_player(interaction.guild.id)
+    while not player.queue.empty():
+        try:
+            player.queue.get_nowait()
+        except:
+            break
+    vc = interaction.guild.voice_client
+    if vc and vc.is_playing():
         vc.stop()
-        await ctx.reply("⏭️ تم السكيب.")
-    else:
-        await ctx.reply("ما في شي شغال.")
+    await interaction.followup.send("تم الإيقاف ✅", ephemeral=True)
 
-@bot.command()
-async def now(ctx: commands.Context):
-    player = get_player(bot, ctx.guild)
-    if player.current:
-        await ctx.reply(f"🎶 الآن: **{player.current.title}**")
-    else:
-        await ctx.reply("ما في شي شغال حالياً.")
+@bot.tree.command(name="ayah", description="يعرض نص آية")
+@app_commands.describe(surah="رقم السورة 1-114", ayah="رقم الآية")
+async def ayah_cmd(interaction: discord.Interaction, surah: int, ayah: int):
+    await interaction.response.defer(ephemeral=False)
+    if surah < 1 or surah > 114:
+        return await interaction.followup.send("رقم السورة لازم بين 1 و 114.")
+    meta = await get_surah_meta(surah)
+    if ayah < 1 or ayah > int(meta["numberOfAyahs"]):
+        return await interaction.followup.send(f"هالسورة فيها {meta['numberOfAyahs']} آية فقط.")
 
-@bot.command()
-async def auto(ctx: commands.Context, mode: str):
-    """auto on/off لتشغيل/إيقاف إعادة التعبئة التلقائية."""
-    player = get_player(bot, ctx.guild)
-    mode = mode.lower().strip()
-    if mode in ("on", "1", "true", "yes"):
-        player.autorefill = True
-        await ctx.reply("✅ Auto refill: ON")
-    elif mode in ("off", "0", "false", "no"):
-        player.autorefill = False
-        await ctx.reply("✅ Auto refill: OFF")
-    else:
-        await ctx.reply("استخدم: `!auto on` أو `!auto off`")
+    text = await get_ayah_text(surah, ayah)
+    await interaction.followup.send(f"**{surah}:{ayah}**\n{text}")
 
-# =========================
-# تشغيل
-# =========================
-if TOKEN == "PUT_YOUR_TOKEN_HERE" or not TOKEN:
-    raise SystemExit("❌ حط توكن البوت في BOT_TOKEN أو في ملف .env (DISCORD_TOKEN).")
+@bot.tree.command(name="play_ayah", description="يشغل آية محددة بالروم الصوتي")
+@app_commands.describe(surah="رقم السورة 1-114", ayah="رقم الآية")
+async def play_ayah_cmd(interaction: discord.Interaction, surah: int, ayah: int):
+    await interaction.response.defer(ephemeral=True)
+    if not interaction.guild:
+        return await interaction.followup.send("هذا الأمر داخل السيرفر فقط.", ephemeral=True)
 
-bot.run(TOKEN)
+    vc = await ensure_voice(interaction)
+    if not vc:
+        return
+
+    meta = await get_surah_meta(surah)
+    if ayah < 1 or ayah > int(meta["numberOfAyahs"]):
+        return await interaction.followup.send(f"هالسورة فيها {meta['numberOfAyahs']} آية فقط.", ephemeral=True)
+
+    player = get_player(interaction.guild.id)
+    url = everyayah_url(surah, ayah)
+    await player.queue.put(url)
+
+    await interaction.followup.send(f"✅ انضافت للطابور: سورة {surah} آية {ayah}", ephemeral=True)
+
+    # شغل loop إذا مو شغال
+    if not vc.is_playing():
+        bot.loop.create_task(play_loop(interaction.guild))
+
+@bot.tree.command(name="play_surah", description="يشغل سورة كاملة (آيات متتالية) بالروم الصوتي")
+@app_commands.describe(surah="رقم السورة 1-114")
+async def play_surah_cmd(interaction: discord.Interaction, surah: int):
+    await interaction.response.defer(ephemeral=True)
+    if not interaction.guild:
+        return await interaction.followup.send("هذا الأمر داخل السيرفر فقط.", ephemeral=True)
+
+    if surah < 1 or surah > 114:
+        return await interaction.followup.send("رقم السورة لازم بين 1 و 114.", ephemeral=True)
+
+    vc = await ensure_voice(interaction)
+    if not vc:
+        return
+
+    meta = await get_surah_meta(surah)
+    count = int(meta["numberOfAyahs"])
+
+    player = get_player(interaction.guild.id)
+    for a in range(1, count + 1):
+        await player.queue.put(everyayah_url(surah, a))
+
+    await interaction.followup.send(f"✅ تم إضافة سورة {surah} كاملة للطابور ({count} آية).", ephemeral=True)
+
+    if not vc.is_playing():
+        bot.loop.create_task(play_loop(interaction.guild))
+
+# ========= Optional Prefix Commands =========
+if ENABLE_PREFIX_COMMANDS:
+    @bot.command(name="playall")
+    async def playall_prefix(ctx: commands.Context, surah: int):
+        # مثل /play_surah
+        if not ctx.guild or not isinstance(ctx.author, discord.Member):
+            return
+        if not ctx.author.voice or not ctx.author.voice.channel:
+            return await ctx.send("ادخل روم صوتي أولاً 🎧")
+
+        vc = ctx.guild.voice_client
+        if not vc or not vc.is_connected():
+            vc = await ctx.author.voice.channel.connect()
+        elif vc.channel != ctx.author.voice.channel:
+            await vc.move_to(ctx.author.voice.channel)
+
+        meta = await get_surah_meta(surah)
+        count = int(meta["numberOfAyahs"])
+        player = get_player(ctx.guild.id)
+        for a in range(1, count + 1):
+            await player.queue.put(everyayah_url(surah, a))
+        await ctx.send(f"✅ أضفت سورة {surah} كاملة ({count} آية).")
+        if not vc.is_playing():
+            bot.loop.create_task(play_loop(ctx.guild))
+
+@bot.event
+async def on_close():
+    global session
+    if session:
+        await session.close()
+
+if not DISCORD_TOKEN:
+    raise RuntimeError("DISCORD_TOKEN is missing")
+
+bot.run(DISCORD_TOKEN)
+
